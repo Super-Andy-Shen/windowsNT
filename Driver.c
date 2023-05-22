@@ -215,12 +215,12 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, UNICODE_STRING str)
 	if (!NT_SUCCESS(status))
 	{
 		DbgPrint("failed to create symbol_link\n");
-		//删除device
+		//delete device
 		IoDeleteDevice(Mydivice);
 		return status;
 	}
 	DbgPrint("success to create symbol_link\n");
-	// 和R3交互
+	// ring3 interaction
 	Mydivice->Flags |= DO_BUFFERED_IO;
 	Driver->MajorFunction[IRP_MJ_CREATE] = Mycreate;
 	Driver->MajorFunction[IRP_MJ_CLOSE] = Myclose;
