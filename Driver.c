@@ -1,11 +1,25 @@
 #include<wdm.h>
 #include<ntddk.h>
 #include<ntstrsafe.h>
+#include<windef.h>
 #define Device_name L"\\Device\\myfirst"
 #define symbol_name L"\\??\\myfirst123"
+#define IOCTL		\
+		CTL_CODE(FILE_DEVICE_UNKNOWN,		\
+				 0x9000,					\
+				 METHOD_BUFFERED,			\
+				 FILE_ANY_ACCESS)
+
 
 UNICODE_STRING str1 = RTL_CONSTANT_STRING(L"I am the first thread");
 UNICODE_STRING str2 = RTL_CONSTANT_STRING(L"I am the second thread");
+KSPIN_LOCK spinlock;
+BYTE mmcode[100] = { 0 };
+BOOLEAN block = FALSE;
+KEVENT kevent = { 0 };
+KEVENT* pevent = NULL;
+PCHAR PsGetProcessImageFileName(IN PEPROCESS process);
+VOID MyThreadProc2(PVOID context);
 VOID drvUnload(PDRIVER_OBJECT Driver)
 {
 	PDEVICE_OBJECT deviceObject = Driver->DeviceObject;
@@ -63,7 +77,6 @@ NTSTATUS Myread(PDEVICE_OBJECT device, PIRP pirp)
 	ULONG readsize = pstack->Parameters.Read.Length;
 
 	RtlCopyMemory(pirp->AssociatedIrp.SystemBuffer, "Hello Andy",strlen("Hello Andy"));
-	
 	//complete routine
 	pirp->IoStatus.Status = status;
 	pirp->IoStatus.Information = strlen("Hello Andy");
@@ -92,7 +105,7 @@ NTSTATUS stringtest()
 	PWCHAR b = L"AB";
 	RtlUnicodeStringInit(&a, b);
 	DbgPrint("Length %d and MaxLength %d, %wZ\n", a.Length, a.MaximumLength, a);
-	//ascii->unicode
+	//窄字符-》宽字符
 	STRING s = { 0 };
 	PWCHAR t = "ABC";
 	RtlInitAnsiString(&s, t);
@@ -155,9 +168,9 @@ NTSTATUS lookasideallocate()
 {
 	NTSTATUS status = STATUS_SUCCESS;
 	PAGED_LOOKASIDE_LIST lookside;
-
+	//创建内存列表
 	ExInitializePagedLookasideList(&lookside, NULL, NULL, PagedPool, sizeof(UNICODE_STRING), 'A', 0);
-	
+	//分配内存并初始化
 	PUNICODE_STRING pstr = ExAllocateFromPagedLookasideList(&lookside);
 	RtlZeroMemory(pstr, sizeof(UNICODE_STRING));
 	
@@ -169,30 +182,102 @@ NTSTATUS lookasideallocate()
 }
 VOID MyThreadProc1(PVOID context)
 {
-	PUNICODE_STRING str = (PUNICODE_STRING)context;
-	for (int i = 0; i < 10; i++)
+	HANDLE thread2 = NULL;
+	KeInitializeEvent(&kevent, NotificationEvent, FALSE);
+	NTSTATUS status = PsCreateSystemThread(&thread2, GENERIC_ALL, NULL, NULL, NULL, MyThreadProc2, (PVOID)&kevent);
+	int i = 0;
+	while (i<10)
 	{
-		DbgPrint("----- %wZ\n", str);
+		KeWaitForSingleObject(&kevent, Executive, KernelMode, FALSE, NULL);
+		for (int i = 0; i < 10; i++)
+		{
+			DbgPrint("mmcode: %c \n",mmcode[i]);
+		}
+		i++;
+		KeResetEvent(&kevent);
 	}
 	PsTerminateSystemThread(STATUS_SUCCESS);
 }
 VOID MyThreadProc2(PVOID context)
 {
-	PUNICODE_STRING str = (PUNICODE_STRING)context;
-	for (int i = 0; i < 10; i++)
+	LARGE_INTEGER sleeptime = { 0 };
+	sleeptime.QuadPart = -10 * 1000 * 1000;
+	PKEVENT pevent = (PKEVENT)context;
+	UNICODE_STRING apiname = { 0 };
+	RtlInitUnicodeString(&apiname, L"ntoskrnl.exe");
+	int i = 0;
+	while (i<10)
 	{
-		DbgPrint("----- %wZ\n", str);
+		KeDelayExecutionThread(KernelMode, FALSE, &sleeptime);
+		RtlZeroMemory(mmcode, 100);
+		RtlCopyMemory(mmcode, apiname.Buffer, sizeof(L"Hello Andy"));
+		DbgPrint("Welcome\n");
+		i++;
+		KeSetEvent(pevent, IO_NO_INCREMENT, FALSE);
 	}
 	PsTerminateSystemThread(STATUS_SUCCESS);
+}
+VOID MyThreadProc3(PVOID context)
+{
+	NTSTATUS status = STATUS_SUCCESS;
+	int i = 0;
+	while (i<10)
+	{
+		status = KeWaitForSingleObject(pevent, Executive, KernelMode, FALSE, NULL);
+		DbgPrint("Hello from kernel\n");
+		i++;
+	}
+	PsTerminateSystemThread(STATUS_SUCCESS);
+}
+NTSTATUS Mycontrol(PDEVICE_OBJECT pdevice, PIRP pirp)
+{
+	NTSTATUS status = STATUS_SUCCESS;
+	PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(pirp);
+	ULONG iocode = stack->Parameters.DeviceIoControl.IoControlCode;
+	DbgPrint("-------%d-------%d\n",iocode,IOCTL);
+	switch (iocode)
+	{
+	case IOCTL:
+	{
+		//DWORD indata = *(PWORD)pirp->AssociatedIrp.SystemBuffer;
+		HANDLE hevent = *(HANDLE*)pirp->AssociatedIrp.SystemBuffer;
+		status = ObReferenceObjectByHandle(hevent, EVENT_MODIFY_STATE, *ExEventObjectType, KernelMode, &pevent, NULL);
+		if (NT_SUCCESS(status))
+		{
+			ObDereferenceObject(pevent);
+			HANDLE hthread = NULL;
+			status = PsCreateSystemThread(&hthread, GENERIC_ALL, NULL, NULL, NULL, MyThreadProc3, NULL);
+
+		}
+	}
+	}
+	return status;
+}
+VOID ProcessFun(HANDLE pid, HANDLE pid2, BOOLEAN create)
+{
+	if (create)
+	{
+		if (pid == PsGetCurrentProcess())
+		{
+			DbgPrint("process create, PID : %d\n",pid2);
+			PEPROCESS temp = NULL;
+			PsLookupProcessByProcessId(pid2, &temp);
+			PUCHAR processname = PsGetProcessImageFileName(temp);
+			DbgPrint("Process Name is %s\n",processname);
+		}
+	}
 }
 NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, UNICODE_STRING str)
 {
 	DbgPrint("Hello\n");
 	Driver->DriverUnload = drvUnload;
 	NTSTATUS status = STATUS_SUCCESS;
+	PsSetCreateProcessNotifyRoutine(ProcessFun, FALSE);
+	
+	
 	
 	PDEVICE_OBJECT Mydivice = NULL;
-	//create device
+	//创建device
 	UNICODE_STRING dname = { 0 };
 	
 	RtlInitUnicodeString(&dname, Device_name);
@@ -205,7 +290,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, UNICODE_STRING str)
 		return status;
 	}
 	DbgPrint("success to create device\n");
-	//symbol link
+	//创建符号链接
 	UNICODE_STRING sname = { 0 };
 
 	RtlInitUnicodeString(&sname, symbol_name);
@@ -215,37 +300,25 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, UNICODE_STRING str)
 	if (!NT_SUCCESS(status))
 	{
 		DbgPrint("failed to create symbol_link\n");
-		//delete device
+		//删除device
 		IoDeleteDevice(Mydivice);
 		return status;
 	}
 	DbgPrint("success to create symbol_link\n");
-	// ring3 interaction
+	// 和R3交互
 	Mydivice->Flags |= DO_BUFFERED_IO;
 	Driver->MajorFunction[IRP_MJ_CREATE] = Mycreate;
 	Driver->MajorFunction[IRP_MJ_CLOSE] = Myclose;
 	Driver->MajorFunction[IRP_MJ_CLEANUP] = Myclean;
 	Driver->MajorFunction[IRP_MJ_READ] = Myread;
     Driver->MajorFunction[IRP_MJ_WRITE] = Mywrite;
+	//Driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = Mycontrol;
 	DbgPrint("success to use MajorFunction\n");
-	HANDLE thread1 = NULL;
-	HANDLE thread2 = NULL;
-	status = PsCreateSystemThread(&thread1, GENERIC_ALL, NULL, NULL, NULL, MyThreadProc1, (PVOID)&str1);
-	if (status != STATUS_SUCCESS)
-	{
-		DbgPrint("fail to create thread1\n");
-		return 0;
-	}
-	KIRQL irql = 0;
-	KeRaiseIrql(2, &irql);
-	status = PsCreateSystemThread(&thread2, GENERIC_ALL, NULL, NULL, NULL, MyThreadProc2, (PVOID)&str2);
-	if (status != STATUS_SUCCESS)
-	{
-		DbgPrint("fail to create thread2\n");
-		return 0;
-	}
-	KeLowerIrql(&irql);
-	ZwClose(thread1);
-	ZwClose(thread2);
+
+
+	//HANDLE thread1 = NULL;
+	/*test for event (example 1)
+	status = PsCreateSystemThread(&thread1, GENERIC_ALL, NULL, NULL, NULL, MyThreadProc1, (PVOID)&kevent);
+	ZwClose(thread1);*/
 	return 0;
 }
